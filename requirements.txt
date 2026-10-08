@@ -1,0 +1,20 @@
+# Video download and stream capture
+yt-dlp>=2024.11.4
+streamlink>=7.0.0
+
+# Speech recognition and local inference
+faster-whisper>=1.1.0
+torch>=2.5.0
+
+# Video processing and data validation
+ffmpeg-python>=0.2.0
+pydantic>=2.0.0
+
+# Ollama OpenAI-compatible client and system metrics
+openai>=1.0.0
+psutil>=6.0.0
+
+# Signal detection used by the next milestone
+langgraph>=1.2.0
+numpy>=1.24.0
+silero-vad>=4.0.0
