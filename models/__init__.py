@@ -1,0 +1,1 @@
+"""Data models shared by the stream processing agents."""
