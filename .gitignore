@@ -118,6 +118,15 @@ ipython_config.py
 .pdm-python
 .pdm-build/
 
+# Project environments and generated media
+.pytest_cache/
+.ruff_cache/
+output/segments/
+output/candidates.jsonl
+output/clips.jsonl
+output/final/
+output/edits.jsonl
+
 # pixi
 #   Similar to Pipfile.lock, it is generally recommended to include pixi.lock in version control.
 # pixi.lock
