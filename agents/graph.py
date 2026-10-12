@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import logging
 import os
 import subprocess
@@ -16,19 +17,24 @@ import numpy as np
 from langgraph.graph import END, START, StateGraph
 from typing_extensions import TypedDict
 
-from models.signals import AudioAnalysis, ChatSpike
+from agents.prompts import build_messages
+from models.signals import AudioAnalysis, ChatSpike, ClipMetadata, _LLMPackage
 
 logger = logging.getLogger(__name__)
 
 SEGMENT_DURATION = int(os.getenv("SEGMENT_DURATION", "45"))
 RMS_THRESHOLD = float(os.getenv("RMS_THRESHOLD", "0.05"))
 RMS_WINDOW_MS = 500
+VIRALITY_THRESHOLD = float(os.getenv("VIRALITY_THRESHOLD", "5.0"))
+WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base")
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "shorts-llm")
 OUTPUT_DIR = Path("output/segments")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
 class Phase2State(TypedDict):
-    """State passed between the audio detection graph nodes."""
+    """State passed through the audio and packaging stages."""
 
     spike: ChatSpike
     segment_path: str
@@ -38,6 +44,10 @@ class Phase2State(TypedDict):
     rms_mean: float
     has_audio_event: bool
     candidate: AudioAnalysis | None
+    transcript_text: str
+    word_timestamps: Annotated[list[dict[str, object]], lambda _old, new: new]
+    language: str
+    clip_metadata: ClipMetadata | None
 
 
 async def download_segment(state: Phase2State) -> dict[str, str]:
@@ -205,8 +215,115 @@ async def discard_segment(state: Phase2State) -> dict[str, object]:
     return {"has_audio_event": False, "candidate": None}
 
 
+async def transcribe_audio(state: Phase2State) -> dict[str, object]:
+    """Transcribe the wav file with Faster-Whisper and return text plus word timestamps."""
+    wav_path = state["wav_path"]
+
+    def run_transcription() -> tuple[str, list[dict[str, object]], str]:
+        from faster_whisper import WhisperModel
+
+        model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
+        segments, info = model.transcribe(wav_path, word_timestamps=True, beam_size=5)
+
+        transcript_parts: list[str] = []
+        word_timestamps: list[dict[str, object]] = []
+        for segment in segments:
+            transcript_parts.append(segment.text.strip())
+            for word in getattr(segment, "words", []) or []:
+                word_timestamps.append(
+                    {
+                        "word": word.word,
+                        "start": round(float(word.start), 3),
+                        "end": round(float(word.end), 3),
+                        "probability": round(float(word.probability), 4),
+                    }
+                )
+
+        transcript_text = " ".join(part for part in transcript_parts if part)
+        language = getattr(info, "language", "en")
+        del model
+        gc.collect()
+        return transcript_text, word_timestamps, language
+
+    transcript_text, word_timestamps, language = await asyncio.get_running_loop().run_in_executor(
+        None, run_transcription
+    )
+    return {
+        "transcript_text": transcript_text,
+        "word_timestamps": word_timestamps,
+        "language": language,
+    }
+
+
+async def package_clip(state: Phase2State) -> dict[str, ClipMetadata]:
+    """Package the transcript into structured clip metadata using the local LLM."""
+    transcript = state["transcript_text"]
+
+    def run_packaging() -> ClipMetadata:
+        import json
+
+        from openai import OpenAI
+
+        client = OpenAI(base_url=OLLAMA_BASE_URL, api_key="ollama")
+        response = client.chat.completions.create(
+            model=OLLAMA_MODEL,
+            messages=build_messages(transcript),
+            response_format={"type": "json_object"},
+            temperature=0.4,
+        )
+        raw_json = response.choices[0].message.content or "{}"
+        try:
+            llm_data = _LLMPackage.model_validate(json.loads(raw_json))
+        except Exception:
+            llm_data = _LLMPackage(
+                title="Unknown Clip",
+                hook_text="Something happened here",
+                virality_score=0.0,
+                tags=[],
+            )
+
+        audio_analysis = state["candidate"]
+        return ClipMetadata(
+            audio_analysis=audio_analysis,
+            transcript_text=state["transcript_text"],
+            word_timestamps=state["word_timestamps"],
+            language=state["language"],
+            title=llm_data.title,
+            hook_text=llm_data.hook_text,
+            virality_score=llm_data.virality_score,
+            tags=llm_data.tags,
+            passed_threshold=False,
+        )
+
+    clip_metadata = await asyncio.get_running_loop().run_in_executor(None, run_packaging)
+    return {"clip_metadata": clip_metadata}
+
+
+def evaluate_virality(state: Phase2State) -> str:
+    """Accept or discard packaged clips based on virality threshold."""
+    metadata = state.get("clip_metadata")
+    if metadata is None:
+        return "discard_transcript"
+    return "finalize_clip" if metadata.virality_score >= VIRALITY_THRESHOLD else "discard_transcript"
+
+
+async def finalize_clip(state: Phase2State) -> dict[str, ClipMetadata]:
+    """Mark the clip as accepted and keep the metadata for later stages."""
+    metadata = state["clip_metadata"]
+    final_metadata = metadata.model_copy(update={"passed_threshold": True})
+    return {"clip_metadata": final_metadata}
+
+
+async def discard_transcript(state: Phase2State) -> dict[str, ClipMetadata | None]:
+    """Drop transcript results that do not clear the virality threshold."""
+    metadata = state.get("clip_metadata")
+    if metadata is not None:
+        return {"clip_metadata": metadata.model_copy(update={"passed_threshold": False})}
+    return {"clip_metadata": None}
+
+
 def build_graph():
-    """Build and compile the phase-2 audio detection graph."""
+    """Build and compile the phase-2 and phase-3 detection pipeline."""
     graph = StateGraph(Phase2State)
     graph.add_node("download_segment", download_segment)
     graph.add_node("extract_audio", extract_audio)
@@ -214,6 +331,10 @@ def build_graph():
     graph.add_node("analyze_rms", analyze_rms)
     graph.add_node("emit_candidate", emit_candidate)
     graph.add_node("discard_segment", discard_segment)
+    graph.add_node("transcribe_audio", transcribe_audio)
+    graph.add_node("package_clip", package_clip)
+    graph.add_node("finalize_clip", finalize_clip)
+    graph.add_node("discard_transcript", discard_transcript)
     graph.add_edge(START, "download_segment")
     graph.add_edge("download_segment", "extract_audio")
     graph.add_edge("extract_audio", "run_vad")
@@ -223,6 +344,14 @@ def build_graph():
         evaluate_signal,
         {"emit_candidate": "emit_candidate", "discard_segment": "discard_segment"},
     )
-    graph.add_edge("emit_candidate", END)
+    graph.add_edge("emit_candidate", "transcribe_audio")
+    graph.add_edge("transcribe_audio", "package_clip")
+    graph.add_conditional_edges(
+        "package_clip",
+        evaluate_virality,
+        {"finalize_clip": "finalize_clip", "discard_transcript": "discard_transcript"},
+    )
+    graph.add_edge("finalize_clip", END)
+    graph.add_edge("discard_transcript", END)
     graph.add_edge("discard_segment", END)
     return graph.compile()
