@@ -18,6 +18,7 @@ from langgraph.graph import END, START, StateGraph
 from typing_extensions import TypedDict
 
 from agents.prompts import build_messages
+from agents.subtitles import escape_ass_path, generate_ass
 from models.signals import AudioAnalysis, ChatSpike, ClipMetadata, _LLMPackage
 
 logger = logging.getLogger(__name__)
@@ -29,12 +30,19 @@ VIRALITY_THRESHOLD = float(os.getenv("VIRALITY_THRESHOLD", "5.0"))
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "shorts-llm")
+CUT_GAP_MS = int(os.getenv("CUT_GAP_MS", "400"))
+VIDEO_LAYOUT = os.getenv("VIDEO_LAYOUT", "center_crop")
+FACECAM_ROI = os.getenv("FACECAM_ROI", "1280,720,640,360")
+VIDEO_CRF = int(os.getenv("VIDEO_CRF", "23"))
+VIDEO_PRESET = os.getenv("VIDEO_PRESET", "fast")
 OUTPUT_DIR = Path("output/segments")
+FINAL_DIR = Path("output/final")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+FINAL_DIR.mkdir(parents=True, exist_ok=True)
 
 
 class Phase2State(TypedDict):
-    """State passed through the audio and packaging stages."""
+    """State passed through the audio, packaging, and render stages."""
 
     spike: ChatSpike
     segment_path: str
@@ -48,6 +56,9 @@ class Phase2State(TypedDict):
     word_timestamps: Annotated[list[dict[str, object]], lambda _old, new: new]
     language: str
     clip_metadata: ClipMetadata | None
+    cut_points: Annotated[list[dict[str, float]], lambda _old, new: new]
+    ass_path: str
+    output_path: str
 
 
 async def download_segment(state: Phase2State) -> dict[str, str]:
@@ -322,8 +333,89 @@ async def discard_transcript(state: Phase2State) -> dict[str, ClipMetadata | Non
     return {"clip_metadata": None}
 
 
+async def prepare_edit(state: Phase2State) -> dict[str, object]:
+    """Trim the effective speaking timeline and generate a subtitle file."""
+    vad_segments = state["vad_segments"]
+    word_timestamps = state["word_timestamps"]
+    segment_path = state["segment_path"]
+
+    gap_threshold = CUT_GAP_MS / 1000.0
+    cut_points: list[dict[str, float]] = []
+    if not vad_segments:
+        cut_points = [{"start": 0.0, "end": float(SEGMENT_DURATION)}]
+    else:
+        for index, segment in enumerate(vad_segments):
+            if index == 0:
+                cut_points.append(segment)
+                continue
+            gap = float(segment["start"]) - float(vad_segments[index - 1]["end"])
+            if gap <= gap_threshold:
+                cut_points[-1] = {
+                    "start": float(cut_points[-1]["start"]),
+                    "end": float(segment["end"]),
+                }
+            else:
+                cut_points.append(segment)
+
+    ass_path = str(Path(segment_path).with_suffix(".ass"))
+    ass_file = await asyncio.get_running_loop().run_in_executor(
+        None,
+        generate_ass,
+        word_timestamps,
+        cut_points,
+        ass_path,
+    )
+    return {"cut_points": cut_points, "ass_path": ass_file}
+
+
+async def render_video(state: Phase2State) -> dict[str, str]:
+    """Render the final 9:16 video with burned-in subtitles."""
+    segment_path = state["segment_path"]
+    ass_path = state["ass_path"]
+    cut_points = state["cut_points"]
+    spike = state["spike"]
+
+    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    output_path = str(FINAL_DIR / f"{spike.channel}_{timestamp}.mp4")
+
+    def build_select_expression(points: list[dict[str, float]]) -> str:
+        parts = [
+            f"between(t\\,{float(item['start']):.3f}\\,{float(item['end']):.3f})"
+            for item in points
+        ]
+        return "+".join(parts) if parts else "1"
+
+    select_expression = build_select_expression(cut_points)
+    escaped_ass_path = escape_ass_path(ass_path)
+
+    ffmpeg_filter = (
+        f"[0:v]select='{select_expression}',setpts=N/FRAME_RATE/TB,"
+        f"crop=iw:ih*9/16:0:(ih-ih*9/16)/2,scale=1080:1920,"
+        f"subtitles='{escaped_ass_path}'[v]"
+    )
+
+    def run_render() -> None:
+        (
+            ffmpeg.input(segment_path)
+            .output(
+                output_path,
+                vf=ffmpeg_filter,
+                crf=VIDEO_CRF,
+                preset=VIDEO_PRESET,
+                movflags="+faststart",
+                pix_fmt="yuv420p",
+                **{"c:v": "libx264", "c:a": "aac"},
+            )
+            .overwrite_output()
+            .run(quiet=True, capture_stdout=True, capture_stderr=True)
+        )
+
+    await asyncio.get_running_loop().run_in_executor(None, run_render)
+    return {"output_path": output_path}
+
+
 def build_graph():
-    """Build and compile the phase-2 and phase-3 detection pipeline."""
+    """Build and compile the phase-2, phase-3 and phase-4 pipeline."""
     graph = StateGraph(Phase2State)
     graph.add_node("download_segment", download_segment)
     graph.add_node("extract_audio", extract_audio)
@@ -335,6 +427,8 @@ def build_graph():
     graph.add_node("package_clip", package_clip)
     graph.add_node("finalize_clip", finalize_clip)
     graph.add_node("discard_transcript", discard_transcript)
+    graph.add_node("prepare_edit", prepare_edit)
+    graph.add_node("render_video", render_video)
     graph.add_edge(START, "download_segment")
     graph.add_edge("download_segment", "extract_audio")
     graph.add_edge("extract_audio", "run_vad")
@@ -351,7 +445,9 @@ def build_graph():
         evaluate_virality,
         {"finalize_clip": "finalize_clip", "discard_transcript": "discard_transcript"},
     )
-    graph.add_edge("finalize_clip", END)
+    graph.add_edge("finalize_clip", "prepare_edit")
+    graph.add_edge("prepare_edit", "render_video")
+    graph.add_edge("render_video", END)
     graph.add_edge("discard_transcript", END)
     graph.add_edge("discard_segment", END)
     return graph.compile()
