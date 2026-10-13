@@ -18,6 +18,19 @@ A small Python project that turns Twitch chat spikes into short-form video clips
 - models/: data structures used across the pipeline
 - tests/: focused regression tests for each milestone slice
 
+## Technologies used
+
+- Python 3.10+
+- Twitch IRC for live chat monitoring
+- FFmpeg for segment extraction, recomposition, and subtitle rendering
+- Pydantic for model validation and structured data
+- LangGraph for the state-based processing graph
+- Whisper / faster-whisper for transcription
+- Silero VAD for speech detection
+- Ollama with local LLMs for clip packaging and virality scoring
+- yt-dlp / streamlink for media acquisition
+- pytest for automated validation
+
 ## Local setup
 
 1. Create a virtual environment and install dependencies.
@@ -30,4 +43,4 @@ A small Python project that turns Twitch chat spikes into short-form video clips
 python -m pytest -q
 ```
 
-The project follows a milestone-based structure so each chunk can be committed independently and reviewed as a clean feature slice.
+
